@@ -14,6 +14,7 @@ import android.graphics.drawable.LayerDrawable;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Html;
 import android.text.TextUtils;
 import android.util.AttributeSet;
 import android.util.LruCache;
@@ -74,6 +75,7 @@ public class BackdropView extends FrameLayout {
     private static final int MAX_BYTES = 6 * 1024 * 1024;
     private static final int MAX_URIS = 12;
     private static final int MAX_HIGHLIGHTS = 6;
+    private static final long YT_TTL_MS = 30 * 60_000L;
 
     private static final Uri WATCH_NEXT = Uri.parse("content://android.media.tv/watch_next_program");
     private static final Uri PREVIEW = Uri.parse("content://android.media.tv/preview_program");
@@ -152,6 +154,8 @@ public class BackdropView extends FrameLayout {
     private final Map<String, Integer> rotation = new HashMap<>();
     private final Map<Integer, Cached> tmdbCache = new HashMap<>();
     private final Map<String, String> genres = new HashMap<>();
+    private List<Slide> ytCache;
+    private long ytAt;
     private final boolean enabled;
     private String wantedPkg;
     private int token;
@@ -393,6 +397,12 @@ public class BackdropView extends FrameLayout {
             return out;
         }
 
+        // YouTube: the latest videos of your channels (config "youtube_channels"), no key needed.
+        if (pkg.equals("com.google.android.youtube.tv")) {
+            List<Slide> yt = youtube();
+            if (!yt.isEmpty()) return yt;
+        }
+
         Integer provider = provider(pkg);
         String key = Extras.str(getContext(), "tmdb_key", "");
         if (provider != null && !key.isEmpty()) {
@@ -416,6 +426,83 @@ public class BackdropView extends FrameLayout {
             out.add(new Slide(uri, Uri.parse(uri), null, null, null));
         }
         return out;
+    }
+
+    /**
+     * Latest long-form videos of the channels in config.json "youtube_channels" (UC... ids), newest
+     * first, from YouTube's public feeds. Shorts are skipped: their thumbnails are portrait.
+     */
+    private List<Slide> youtube() {
+        JSONArray ids = Extras.config(getContext()).optJSONArray("youtube_channels");
+        if (ids == null || ids.length() == 0) return Collections.emptyList();
+        long now = System.currentTimeMillis();
+        if (ytCache != null && now - ytAt < YT_TTL_MS) return ytCache;
+        List<String[]> videos = new ArrayList<>();   // published, id, title, channel
+        for (int i = 0; i < Math.min(ids.length(), 20); i++) {
+            String id = ids.optString(i, "");
+            if (!id.startsWith("UC")) continue;
+            try {
+                String body = Extras.get("https://www.youtube.com/feeds/videos.xml?channel_id=" + id, null);
+                if (body == null) continue;
+                String[] entries = body.split("<entry>");
+                int kept = 0;
+                for (int e = 1; e < entries.length && kept < 3; e++) {
+                    String entry = entries[e];
+                    if (entry.contains("/shorts/")) continue;
+                    String vid = between(entry, "<yt:videoId>", "</yt:videoId>");
+                    String title = between(entry, "<title>", "</title>");
+                    String published = between(entry, "<published>", "</published>");
+                    String author = between(between(entry, "<author>", "</author>"), "<name>", "</name>");
+                    if (vid.isEmpty() || title.isEmpty()) continue;
+                    videos.add(new String[]{published, vid, unescape(title), unescape(author)});
+                    kept++;
+                }
+            } catch (Exception ignored) {
+                // Skip this channel.
+            }
+        }
+        Collections.sort(videos, (a, b) -> b[0].compareTo(a[0]));
+        List<Slide> out = new ArrayList<>();
+        for (int i = 0; i < Math.min(videos.size(), MAX_HIGHLIGHTS); i++) {
+            String[] v = videos.get(i);
+            out.add(new Slide("yt:" + v[1], Uri.parse("https://i.ytimg.com/vi/" + v[1] + "/maxresdefault.jpg"),
+                    v[3], v[2], "YouTube \u00b7 " + ago(v[0])));
+        }
+        if (!out.isEmpty() || ytCache == null) {
+            ytCache = out;
+            ytAt = now;
+        }
+        return out.isEmpty() && ytCache != null ? ytCache : out;
+    }
+
+    private static String between(String s, String start, String end) {
+        int a = s.indexOf(start);
+        if (a < 0) return "";
+        a += start.length();
+        int b = s.indexOf(end, a);
+        return b < 0 ? "" : s.substring(a, b).trim();
+    }
+
+    private static String unescape(String s) {
+        return Html.fromHtml(s, Html.FROM_HTML_MODE_LEGACY).toString();
+    }
+
+    /** "il y a 3 h", "hier", "il y a 4 jours" from an ISO date. */
+    private static String ago(String iso) {
+        boolean fr = Extras.french();
+        try {
+            Date d = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ROOT).parse(iso);
+            long min = Math.max(0, (System.currentTimeMillis() - d.getTime()) / 60_000L);
+            if (min < 60) return fr ? "il y a " + Math.max(1, min) + " min" : min + " min ago";
+            long h = min / 60;
+            if (h < 24) return fr ? "il y a " + h + " h" : h + " h ago";
+            long days = h / 24;
+            if (days == 1) return fr ? "hier" : "yesterday";
+            if (days < 30) return fr ? "il y a " + days + " jours" : days + " days ago";
+            return fr ? "il y a " + (days / 30) + " mois" : (days / 30) + " months ago";
+        } catch (Exception e) {
+            return fr ? "nouvelle vid\u00e9o" : "new video";
+        }
     }
 
     private Integer provider(String pkg) {
@@ -557,6 +644,12 @@ public class BackdropView extends FrameLayout {
             bytes = Files.readAllBytes(disk.toPath());
         } else {
             bytes = download(slide.image);
+            if (bytes == null && slide.key.startsWith("yt:")) {
+                // Not every video has a full-HD thumbnail: try the 720p one, then the standard one.
+                String id = slide.key.substring(3);
+                bytes = download(Uri.parse("https://i.ytimg.com/vi/" + id + "/hq720.jpg"));
+                if (bytes == null) bytes = download(Uri.parse("https://i.ytimg.com/vi/" + id + "/hqdefault.jpg"));
+            }
             if (bytes == null) return null;
         }
         Bitmap bitmap = decode(bytes);
