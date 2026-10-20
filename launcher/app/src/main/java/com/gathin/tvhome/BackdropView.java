@@ -3,21 +3,28 @@ package com.gathin.tvhome;
 import android.animation.ObjectAnimator;
 import android.animation.PropertyValuesHolder;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.util.AttributeSet;
 import android.util.LruCache;
+import android.util.TypedValue;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -29,51 +36,111 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Full-screen artwork behind the dock, taken from the app you are on: what the app publishes to the
- * TV's "Watch next" row first (the show you are watching), then its home-screen channels (what it
- * recommends). Shown with a slow cross-fade and a slow drift, under a black scrim that keeps the
- * dock and the clock readable. On an OLED panel the black stays black; with Philips Ambilight in
- * "Follow video" the wall takes the colours of the artwork.
+ * Full-screen artwork behind the dock for the app you are on, in this order:
+ *  1. your own picture, <external files>/backdrops/<package>.jpg;
+ *  2. "À la une": what is popular now on that service in your country, from TMDB (free key in
+ *     config.json "tmdb_key"), with the title, kind, genre and year, rotating every 8 seconds;
+ *  3. what the app publishes to the TV's home screen ("Watch next", then its channels);
+ *  4. nothing: the coloured ambient glow underneath shows instead.
+ * Cross-fade, slow drift, and a scrim (black at night, light by day) that keeps the dock readable.
+ * With Philips Ambilight in "Follow video" the wall takes the colours of the artwork.
  *
- * Needs android.permission.READ_TV_LISTINGS (granted over adb at install) to read other apps'
- * listings. Your own picture wins when there is one: <external files>/backdrops/<package>.jpg.
- * Nothing found: the view stays clear and the coloured ambient glow underneath shows instead.
- *
- * config.json: "backdrops": true/false (default true).
+ * config.json: "backdrops" (default true), "tmdb_key", "region" (default FR),
+ * "tmdb_providers": {"package": providerId} to add or override services.
  */
 public class BackdropView extends FrameLayout {
 
-    private static final long DWELL_MS = 350;      // wait this long on a tile before loading
+    private static final long DWELL_MS = 350;
     private static final long FADE_MS = 700;
     private static final long DRIFT_MS = 24000;
-    private static final int TARGET_W = 1280;      // decode width; the TV upscales smoothly
+    private static final long ROTATE_MS = 8000;
+    private static final long TMDB_TTL_MS = 3 * 3_600_000L;
+    private static final int TARGET_W = 1280;
     private static final int MAX_BYTES = 6 * 1024 * 1024;
     private static final int MAX_URIS = 12;
+    private static final int MAX_HIGHLIGHTS = 6;
 
     private static final Uri WATCH_NEXT = Uri.parse("content://android.media.tv/watch_next_program");
     private static final Uri PREVIEW = Uri.parse("content://android.media.tv/preview_program");
     private static final String[] COLUMNS = {
             "poster_art_uri", "poster_art_aspect_ratio", "thumbnail_uri", "thumbnail_aspect_ratio"};
-    // TvContract aspect ratios: 0 = 16:9, 1 = 3:2, 2 = 4:3 (landscape); others portrait or square.
+
+    /** TMDB watch-provider ids of the apps people have on a French TV. */
+    private static final Map<String, Integer> PROVIDERS = new HashMap<>();
+
+    static {
+        PROVIDERS.put("com.netflix.ninja", 8);
+        PROVIDERS.put("com.amazon.amazonvideo.livingroom", 119);
+        PROVIDERS.put("com.disney.disneyplus", 337);
+        PROVIDERS.put("com.apple.atve.androidtv.appletv", 350);
+        PROVIDERS.put("com.crunchyroll.crunchyroid", 283);
+        PROVIDERS.put("com.canal.android.canal", 381);
+    }
+
     private static boolean landscape(int ratio) {
-        return ratio == 0 || ratio == 1 || ratio == 2;
+        return ratio == 0 || ratio == 1 || ratio == 2;   // 16:9, 3:2, 4:3
+    }
+
+    /** One picture to show, with an optional caption. */
+    private static final class Slide {
+        final String key;
+        final Uri image;
+        final String kicker, title, meta;
+
+        Slide(String key, Uri image, String kicker, String title, String meta) {
+            this.key = key;
+            this.image = image;
+            this.kicker = kicker;
+            this.title = title;
+            this.meta = meta;
+        }
+    }
+
+    private static final class Highlight {
+        final String image, title, meta;
+
+        Highlight(String image, String title, String meta) {
+            this.image = image;
+            this.title = title;
+            this.meta = meta;
+        }
+    }
+
+    private static final class Cached {
+        final long at;
+        final List<Highlight> items;
+
+        Cached(long at, List<Highlight> items) {
+            this.at = at;
+            this.items = items;
+        }
     }
 
     private final ImageView[] layers = new ImageView[2];
     private final ObjectAnimator[] drifts = new ObjectAnimator[2];
     private int front = 0;
     private final View scrim;
+    private final LayerDrawable scrimNight, scrimDay;
+    private final LinearLayout caption;
+    private final TextView kicker, title, meta;
+    private final float dp;
+    private View hero;
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final LruCache<String, Bitmap> memory = new LruCache<String, Bitmap>(16 * 1024 * 1024) {
@@ -83,14 +150,21 @@ public class BackdropView extends FrameLayout {
         }
     };
     private final Map<String, Integer> rotation = new HashMap<>();
+    private final Map<Integer, Cached> tmdbCache = new HashMap<>();
+    private final Map<String, String> genres = new HashMap<>();
     private final boolean enabled;
     private String wantedPkg;
     private int token;
+    private List<Slide> slides;
+    private int slideIndex;
     private final Runnable pending = this::load;
+    private final Runnable rotate = this::nextSlide;
 
     public BackdropView(Context context, AttributeSet attrs) {
         super(context, attrs);
-        enabled = readEnabled(context);
+        Extras.installWatchdog(context);
+        enabled = !Extras.safeMode(context) && Extras.bool(context, "backdrops", true);
+        dp = getResources().getDisplayMetrics().density;
         setFocusable(false);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         for (int i = 0; i < 2; i++) {
@@ -101,36 +175,63 @@ public class BackdropView extends FrameLayout {
             addView(iv, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             layers[i] = iv;
         }
+        scrimNight = scrim(0xFF000000, 0xA6000000);
+        scrimDay = scrim(Theme.PAPER, 0xB3F5F5F7);
         scrim = new View(context);
-        scrim.setBackground(new LayerDrawable(new Drawable[]{
-                // Bottom: black under the dock, fading out by the middle of the screen.
-                new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, new int[]{
-                        0xFF000000, 0xE0000000, 0x8C000000, 0x26000000, 0x00000000, 0x00000000}),
-                // Left: shade behind the app name and the clock.
-                new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{
-                        0xA6000000, 0x4D000000, 0x00000000, 0x00000000}),
-                // Top: a light touch for the clock and the buttons, keeping the top edge lit for Ambilight.
-                new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{
-                        0x40000000, 0x00000000, 0x00000000, 0x00000000}),
-        }));
+        scrim.setBackground(scrimNight);
         scrim.setAlpha(0f);
         addView(scrim, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
+        Typeface font = null;
+        try {
+            font = getResources().getFont(R.font.outfit);
+        } catch (Exception ignored) {
+            // System font then.
+        }
+        caption = new LinearLayout(context);
+        caption.setOrientation(LinearLayout.VERTICAL);
+        caption.setAlpha(0f);
+        kicker = label(context, 12, font, "'wght' 500");
+        kicker.setLetterSpacing(0.22f);
+        kicker.setAllCaps(true);
+        title = label(context, 44, font, "'wght' 300");
+        title.setLetterSpacing(-0.02f);
+        meta = label(context, 15, font, "'wght' 400");
+        caption.addView(kicker);
+        caption.addView(title);
+        caption.addView(meta);
+        LayoutParams lp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = Math.round(68 * dp);
+        addView(caption, lp);
     }
 
-    private static boolean readEnabled(Context context) {
-        try {
-            File dir = context.getExternalFilesDir(null);
-            File file = dir != null ? new File(dir, "config.json") : null;
-            if (file != null && file.isFile()) {
-                JSONObject json = new JSONObject(
-                        new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
-                if (json.has("backdrops")) return json.getBoolean("backdrops");
-            }
-        } catch (Exception ignored) {
-            // A missing or broken config keeps the default; it must never break Home.
-        }
-        return true;
+    private static LayerDrawable scrim(int solid, int side) {
+        int c = solid & 0x00FFFFFF;
+        int s = side & 0x00FFFFFF;
+        int sa = side >>> 24;
+        return new LayerDrawable(new Drawable[]{
+                new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, new int[]{
+                        0xFF000000 | c, 0xE0000000 | c, 0x8C000000 | c, 0x26000000 | c, c, c}),
+                new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{
+                        (sa << 24) | s, ((sa / 2) << 24) | s, s, s}),
+                new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{
+                        0x40000000 | c, c, c, c}),
+        });
     }
+
+    private TextView label(Context context, float sp, Typeface font, String weight) {
+        TextView t = new TextView(context);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        if (font != null) t.setTypeface(font);
+        t.setFontVariationSettings(weight);
+        t.setSingleLine(true);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        t.setIncludeFontPadding(false);
+        t.setPadding(0, Math.round(3 * dp), 0, Math.round(3 * dp));
+        return t;
+    }
+
+    // ---- main thread -----------------------------------------------------------------------------------
 
     /** The user is on this app's tile. Loads its artwork after a short dwell. */
     public void show(String pkg) {
@@ -141,14 +242,17 @@ public class BackdropView extends FrameLayout {
         if (pkg.equals(wantedPkg)) return;
         wantedPkg = pkg;
         main.removeCallbacks(pending);
+        main.removeCallbacks(rotate);
         main.postDelayed(pending, DWELL_MS);
     }
 
     /** Focus left the dock: fade the artwork out. */
     public void hide() {
         wantedPkg = null;
+        slides = null;
         token++;
         main.removeCallbacks(pending);
+        main.removeCallbacks(rotate);
         fadeOut();
     }
 
@@ -157,22 +261,55 @@ public class BackdropView extends FrameLayout {
         if (pkg == null) return;
         final int mine = ++token;
         io.execute(() -> {
+            List<Slide> found = null;
             Bitmap bitmap = null;
             try {
-                bitmap = fetch(pkg);
+                found = slides(pkg);
+                if (!found.isEmpty()) bitmap = bitmap(found.get(0));
             } catch (Throwable ignored) {
                 // Artwork is decoration: any failure just leaves the glow.
             }
-            final Bitmap result = bitmap;
+            final List<Slide> s = found;
+            final Bitmap b = bitmap;
             main.post(() -> {
                 if (mine != token || !pkg.equals(wantedPkg)) return;
-                if (result == null) fadeOut();
-                else present(result);
+                if (b == null) {
+                    fadeOut();
+                    return;
+                }
+                slides = s;
+                slideIndex = 0;
+                present(b, s.get(0));
+                if (s.size() > 1) main.postDelayed(rotate, ROTATE_MS);
             });
         });
     }
 
-    private void present(Bitmap bitmap) {
+    private void nextSlide() {
+        final List<Slide> s = slides;
+        final String pkg = wantedPkg;
+        if (s == null || pkg == null || s.size() < 2) return;
+        final int mine = token;
+        final int index = (slideIndex + 1) % s.size();
+        io.execute(() -> {
+            Bitmap b = null;
+            try {
+                b = bitmap(s.get(index));
+            } catch (Throwable ignored) {
+                // Skip this one.
+            }
+            final Bitmap result = b;
+            main.post(() -> {
+                if (mine != token || !pkg.equals(wantedPkg)) return;
+                slideIndex = index;
+                if (result != null) present(result, s.get(index));
+                main.postDelayed(rotate, ROTATE_MS);
+            });
+        });
+    }
+
+    private void present(Bitmap bitmap, Slide slide) {
+        scrim.setBackground(Theme.day ? scrimDay : scrimNight);
         int back = 1 - front;
         ImageView next = layers[back];
         ImageView old = layers[front];
@@ -193,6 +330,37 @@ public class BackdropView extends FrameLayout {
         scrim.animate().cancel();
         scrim.animate().alpha(1f).setDuration(FADE_MS).start();
         front = back;
+        showCaption(slide);
+    }
+
+    private void showCaption(Slide slide) {
+        View h = hero();
+        if (slide.title == null) {
+            caption.animate().cancel();
+            caption.animate().alpha(0f).setDuration(200).start();
+            if (h != null) h.setVisibility(VISIBLE);
+            return;
+        }
+        if (h != null) h.setVisibility(INVISIBLE);
+        int ink = Theme.day ? Theme.INK : 0xFFFFFFFF;
+        caption.animate().cancel();
+        caption.animate().alpha(0f).setDuration(caption.getAlpha() > 0 ? 160 : 0).withEndAction(() -> {
+            kicker.setText(slide.kicker);
+            kicker.setTextColor((ink & 0x00FFFFFF) | 0xB3000000);
+            title.setText(slide.title);
+            title.setTextColor(ink);
+            meta.setText(slide.meta);
+            meta.setTextColor((ink & 0x00FFFFFF) | 0xA6000000);
+            int maxW = Math.max(1, Math.round(getWidth() * 0.6f));
+            title.setMaxWidth(maxW);
+            caption.measure(MeasureSpec.makeMeasureSpec(maxW, MeasureSpec.AT_MOST),
+                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+            float bottom = (h != null && h.getHeight() > 0)
+                    ? h.getY() + h.getHeight() : getHeight() * 0.62f;
+            caption.setY(bottom - caption.getMeasuredHeight());
+            caption.setTranslationX(12 * dp);
+            caption.animate().alpha(1f).translationX(0f).setDuration(320).start();
+        }).start();
     }
 
     private void fadeOut() {
@@ -202,22 +370,155 @@ public class BackdropView extends FrameLayout {
         }
         scrim.animate().cancel();
         scrim.animate().alpha(0f).setDuration(400).start();
+        caption.animate().cancel();
+        caption.animate().alpha(0f).setDuration(200).start();
+        View h = hero();
+        if (h != null) h.setVisibility(VISIBLE);
     }
 
-    // ---- background thread -------------------------------------------------------------------------
+    /** The app name MainActivity shows above the dock; hidden while a title is on screen. */
+    private View hero() {
+        if (hero == null && getParent() instanceof View) hero = ((View) getParent()).findViewById(R.id.heroName);
+        return hero;
+    }
 
-    private Bitmap fetch(String pkg) throws Exception {
+    // ---- background thread -----------------------------------------------------------------------------
+
+    private List<Slide> slides(String pkg) {
+        List<Slide> out = new ArrayList<>();
         File dir = getContext().getExternalFilesDir(null);
         File own = dir != null ? new File(new File(dir, "backdrops"), pkg + ".jpg") : null;
-        if (own != null && own.isFile()) return cached("file:" + own.getPath(), Uri.fromFile(own));
+        if (own != null && own.isFile()) {
+            out.add(new Slide("file:" + own.getPath(), Uri.fromFile(own), null, null, null));
+            return out;
+        }
+
+        Integer provider = provider(pkg);
+        String key = Extras.str(getContext(), "tmdb_key", "");
+        if (provider != null && !key.isEmpty()) {
+            List<Highlight> items = highlights(provider, key);
+            if (!items.isEmpty()) {
+                String app = appLabel(pkg);
+                String k = (Extras.french() ? "À la une sur " : "Trending on ") + app;
+                for (Highlight hl : items) {
+                    out.add(new Slide(hl.image, Uri.parse(hl.image), k, hl.title, hl.meta));
+                }
+                return out;
+            }
+        }
 
         List<String> uris = artwork(pkg);
-        if (uris.isEmpty()) return null;
-        Integer last = rotation.get(pkg);
-        int n = last == null ? 0 : last + 1;
-        rotation.put(pkg, n);
-        String uri = uris.get(n % uris.size());
-        return cached(uri, Uri.parse(uri));
+        if (!uris.isEmpty()) {
+            Integer last = rotation.get(pkg);
+            int n = last == null ? 0 : last + 1;
+            rotation.put(pkg, n);
+            String uri = uris.get(n % uris.size());
+            out.add(new Slide(uri, Uri.parse(uri), null, null, null));
+        }
+        return out;
+    }
+
+    private Integer provider(String pkg) {
+        JSONObject custom = Extras.config(getContext()).optJSONObject("tmdb_providers");
+        if (custom != null && custom.has(pkg)) {
+            int id = custom.optInt(pkg, 0);
+            return id > 0 ? id : null;
+        }
+        return PROVIDERS.get(pkg);
+    }
+
+    private String appLabel(String pkg) {
+        try {
+            PackageManager pm = getContext().getPackageManager();
+            return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (Exception e) {
+            return pkg;
+        }
+    }
+
+    /** Popular titles of the last year on this service, series and films alternating. */
+    private List<Highlight> highlights(int provider, String key) {
+        Cached hit = tmdbCache.get(provider);
+        long now = System.currentTimeMillis();
+        if (hit != null && now - hit.at < TMDB_TTL_MS) return hit.items;
+        List<Highlight> tv = discover("tv", provider, key);
+        List<Highlight> movie = discover("movie", provider, key);
+        List<Highlight> mixed = new ArrayList<>();
+        for (int i = 0; mixed.size() < MAX_HIGHLIGHTS && (i < tv.size() || i < movie.size()); i++) {
+            if (i < tv.size()) mixed.add(tv.get(i));
+            if (i < movie.size() && mixed.size() < MAX_HIGHLIGHTS) mixed.add(movie.get(i));
+        }
+        if (!mixed.isEmpty() || hit == null) tmdbCache.put(provider, new Cached(now, mixed));
+        return mixed.isEmpty() && hit != null ? hit.items : mixed;
+    }
+
+    private List<Highlight> discover(String type, int provider, String key) {
+        List<Highlight> out = new ArrayList<>();
+        try {
+            boolean tv = type.equals("tv");
+            boolean fr = Extras.french();
+            String lang = fr ? "fr-FR" : "en-US";
+            String region = Extras.str(getContext(), "region", "FR");
+            String since = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
+                    .format(new Date(System.currentTimeMillis() - 365L * 86_400_000L));
+            loadGenres(type, lang, key);
+            String url = "https://api.themoviedb.org/3/discover/" + type
+                    + "?language=" + lang + "&watch_region=" + region
+                    + "&with_watch_providers=" + provider
+                    + "&with_watch_monetization_types=flatrate&include_adult=false&sort_by=popularity.desc"
+                    + "&" + (tv ? "first_air_date.gte" : "primary_release_date.gte") + "=" + since
+                    + auth(key);
+            String body = Extras.get(url, bearer(key));
+            if (body == null) return out;
+            JSONArray results = new JSONObject(body).optJSONArray("results");
+            if (results == null) return out;
+            for (int i = 0; i < results.length() && out.size() < MAX_HIGHLIGHTS; i++) {
+                JSONObject r = results.optJSONObject(i);
+                if (r == null) continue;
+                String backdrop = r.optString("backdrop_path", "");
+                String name = r.optString(tv ? "name" : "title", "");
+                if (backdrop.isEmpty() || "null".equals(backdrop) || name.isEmpty()) continue;
+                String date = r.optString(tv ? "first_air_date" : "release_date", "");
+                StringBuilder m = new StringBuilder(tv ? (fr ? "Série" : "Series") : (fr ? "Film" : "Film"));
+                JSONArray g = r.optJSONArray("genre_ids");
+                if (g != null && g.length() > 0) {
+                    String gn = genres.get(type + ":" + g.optInt(0));
+                    if (gn != null) m.append(" · ").append(gn);
+                }
+                if (date.length() >= 4) m.append(" · ").append(date, 0, 4);
+                out.add(new Highlight("https://image.tmdb.org/t/p/w1280" + backdrop, name, m.toString()));
+            }
+        } catch (Exception ignored) {
+            // No highlights then; the next source takes over.
+        }
+        return out;
+    }
+
+    private void loadGenres(String type, String lang, String key) {
+        if (genres.containsKey(type + ":loaded")) return;
+        try {
+            String body = Extras.get("https://api.themoviedb.org/3/genre/" + type + "/list?language=" + lang
+                    + auth(key), bearer(key));
+            if (body == null) return;
+            JSONArray list = new JSONObject(body).optJSONArray("genres");
+            if (list == null) return;
+            for (int i = 0; i < list.length(); i++) {
+                JSONObject g = list.optJSONObject(i);
+                if (g != null) genres.put(type + ":" + g.optInt("id"), g.optString("name"));
+            }
+            genres.put(type + ":loaded", "1");
+        } catch (Exception ignored) {
+            // Titles show without a genre.
+        }
+    }
+
+    /** A v4 read token (starts with "eyJ") goes in a header; a v3 key goes in the URL. */
+    private static String bearer(String key) {
+        return key.startsWith("eyJ") ? key : null;
+    }
+
+    private static String auth(String key) {
+        return key.startsWith("eyJ") ? "" : "&api_key=" + Uri.encode(key);
     }
 
     /** Landscape artwork the app published, "Watch next" first; portrait only if there is nothing else. */
@@ -242,25 +543,26 @@ public class BackdropView extends FrameLayout {
                 // No permission, or the table doesn't exist on this TV: try the next one.
             }
         }
-        return new ArrayList<>(wide.isEmpty() ? other : wide);
+        List<String> list = new ArrayList<>(wide.isEmpty() ? other : wide);
+        return Collections.unmodifiableList(list);
     }
 
-    private Bitmap cached(String key, Uri uri) throws Exception {
-        Bitmap hit = memory.get(key);
+    private Bitmap bitmap(Slide slide) throws Exception {
+        Bitmap hit = memory.get(slide.key);
         if (hit != null) return hit;
         File cacheDir = new File(getContext().getCacheDir(), "backdrops");
-        File disk = new File(cacheDir, sha1(key) + ".jpg");
+        File disk = new File(cacheDir, sha1(slide.key) + ".jpg");
         byte[] bytes;
         if (disk.isFile()) {
             bytes = Files.readAllBytes(disk.toPath());
         } else {
-            bytes = download(uri);
+            bytes = download(slide.image);
             if (bytes == null) return null;
         }
         Bitmap bitmap = decode(bytes);
         if (bitmap == null) return null;
         if (!disk.isFile()) save(cacheDir, disk, bitmap);
-        memory.put(key, bitmap);
+        memory.put(slide.key, bitmap);
         return bitmap;
     }
 
@@ -316,9 +618,9 @@ public class BackdropView extends FrameLayout {
         try {
             if (!cacheDir.isDirectory() && !cacheDir.mkdirs()) return;
             File[] files = cacheDir.listFiles();
-            if (files != null && files.length > 60) {
+            if (files != null && files.length > 80) {
                 Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-                for (int i = 0; i < files.length - 40; i++) files[i].delete();
+                for (int i = 0; i < files.length - 60; i++) files[i].delete();
             }
             try (FileOutputStream out = new FileOutputStream(disk)) {
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out);
@@ -339,6 +641,7 @@ public class BackdropView extends FrameLayout {
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         main.removeCallbacks(pending);
+        main.removeCallbacks(rotate);
         for (ObjectAnimator d : drifts) if (d != null) d.cancel();
     }
 }
