@@ -5,8 +5,8 @@
     android:layout_height="match_parent"
     android:background="#FF000000">
 
-    <!-- Ambient glow in the colour of the focused dock app. -->
-    <View
+    <!-- Ambient glow in the colour of the focused dock app, plus edge bands for Ambilight. -->
+    <com.gathin.tvhome.EdgeGlowView
         android:id="@+id/ambient"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
