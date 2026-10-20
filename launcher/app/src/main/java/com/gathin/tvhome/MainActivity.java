@@ -170,6 +170,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         public void run() {
             updateGreeting();
             updateWifiLabel();
+            Theme.apply(MainActivity.this);
             handler.postDelayed(this, MINUTE_MS);
         }
     };
@@ -363,6 +364,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         updateGreeting();
         updateWifiLabel();
         updateInputsButton();
+        Theme.apply(this);
         handler.postDelayed(minuteTick, MINUTE_MS);
     }
 
