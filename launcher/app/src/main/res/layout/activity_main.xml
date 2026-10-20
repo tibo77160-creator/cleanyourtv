@@ -12,6 +12,12 @@
         android:layout_height="match_parent"
         android:alpha="0" />
 
+    <!-- Full-screen artwork from the focused app (Watch next, then its channels). -->
+    <com.gathin.tvhome.BackdropView
+        android:id="@+id/backdrop"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
     <!-- Top shelf: the focused dock app's name, positioned above the dock in code. -->
     <TextView
         android:id="@+id/heroName"
