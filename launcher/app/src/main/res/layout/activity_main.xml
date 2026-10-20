@@ -33,6 +33,14 @@
         android:includeFontPadding="false"
         android:singleLine="true" />
 
+    <!-- Focus highlight that springs between tiles: a soft shadow behind the focused tile, under the grid. -->
+    <com.gathin.tvhome.GlassView
+        android:id="@+id/glass"
+        android:layout_width="10dp"
+        android:layout_height="10dp"
+        android:alpha="0"
+        android:importantForAccessibility="no" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -216,11 +224,4 @@
         </FrameLayout>
     </LinearLayout>
 
-    <!-- The single floating glass highlight that springs between tiles. -->
-    <com.gathin.tvhome.GlassView
-        android:id="@+id/glass"
-        android:layout_width="10dp"
-        android:layout_height="10dp"
-        android:alpha="0"
-        android:importantForAccessibility="no" />
 </FrameLayout>
