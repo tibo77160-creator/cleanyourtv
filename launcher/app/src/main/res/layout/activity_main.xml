@@ -179,6 +179,13 @@
                     android:drawableStart="@drawable/ic_wifi"
                     android:nextFocusDown="@+id/grid" />
 
+                <!-- Weather pill: OK opens the forecast drawer (WeatherView, Open-Meteo). -->
+                <com.gathin.tvhome.WeatherView
+                    android:id="@+id/btnWeather"
+                    style="@style/TopButton"
+                    android:singleLine="true"
+                    android:nextFocusDown="@+id/grid" />
+
                 <TextView
                     android:id="@+id/btnSettings"
                     style="@style/TopButton"
